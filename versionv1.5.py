@@ -11,10 +11,11 @@ import threading
 from datetime import datetime
 import onnxruntime as ort
 
-# --- PAGE CONFIGURATION ---
+# --- 1. SETTINGS & PATHS ----
 st.set_page_config(page_title="EdgeSecure AI", page_icon="🛡️", layout="wide")
+ABS_FILE_PATH = os.path.abspath("temp_session.wav")
 
-# --- UI POLISHING ---
+# --- 2. CSS STYLING ---
 st.markdown("""
     <style>
     .main { background-color: #0b0e14; color: #e0e0e0; font-family: 'Inter', sans-serif; }
@@ -26,7 +27,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- INITIALIZE SESSION STATE ---
+# --- 3. INITIALIZE SESSION STATE ---
 if 'recording_active' not in st.session_state:
     st.session_state.recording_active = False
 if 'transcript' not in st.session_state:
@@ -37,26 +38,26 @@ if 'doc_text' not in st.session_state:
     st.session_state.doc_text = ""
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
-if 'frames' not in st.session_state:
-    st.session_state.frames = []
+if 'file_ready' not in st.session_state:
+    st.session_state.file_ready = False
 
-# --- AMD NPU DETECTION ---
+# --- 4. HARDWARE & AI FUNCTIONS ---
 def check_amd_npu():
     providers = ort.get_available_providers()
     if 'DmlExecutionProvider' in providers:
-        return True, "DirectML (AMD NPU/GPU) Active"
+        return True, "DirectML (AMD Ryzen AI) Active"
     return False, "Standard CPU Mode"
 
-# --- BACKGROUND RECORDING FUNCTION ---
-def recording_thread_func(ghost_mode):
-    """ This runs in the background to avoid freezing the UI """
+def recording_background_worker(ghost_mode):
+    """ Background thread to capture audio without freezing UI """
     p = pyaudio.PyAudio()
     try:
+        # WASAPI Loopback Config
         wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
         default_mic = p.get_device_info_by_index(wasapi_info["defaultInputDevice"])
         default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
 
-        if not default_speakers["isLoopbackDevice"]:
+        if ghost_mode and not default_speakers["isLoopbackDevice"]:
             for loopback in p.get_loopback_device_info_generator():
                 if default_speakers["name"] in loopback["name"]:
                     default_speakers = loopback
@@ -66,12 +67,13 @@ def recording_thread_func(ghost_mode):
         loop_rate = int(default_speakers["defaultSampleRate"])
         
         mic_stream = p.open(format=pyaudio.paInt16, channels=1, rate=mic_rate, input=True, input_device_index=default_mic["index"])
+        
         loop_stream = None
         if ghost_mode:
             loop_stream = p.open(format=pyaudio.paInt16, channels=default_speakers["maxInputChannels"], 
                                  rate=loop_rate, input=True, input_device_index=default_speakers["index"])
 
-        st.session_state.frames = []
+        frames = []
         
         while st.session_state.recording_active:
             m_data = mic_stream.read(1024, exception_on_overflow=False)
@@ -82,121 +84,123 @@ def recording_thread_func(ghost_mode):
                 l_data = loop_stream.read(l_chunk, exception_on_overflow=False)
                 l_audio = np.frombuffer(l_data, dtype=np.int16)
                 
+                # Resample system audio to match mic
                 if default_speakers["maxInputChannels"] > 1:
                     l_audio = l_audio.reshape(-1, default_speakers["maxInputChannels"])[:, 0]
-                
                 indices = np.linspace(0, len(l_audio) - 1, num=len(m_audio))
                 l_audio = l_audio[indices.astype(int)]
                 
                 mixed = (m_audio // 2 + l_audio // 2).astype(np.int16)
-                st.session_state.frames.append(mixed.tobytes())
+                frames.append(mixed.tobytes())
             else:
-                st.session_state.frames.append(m_audio.tobytes())
+                frames.append(m_audio.tobytes())
 
-        # Save the file once the loop breaks
-        with wave.open("temp_session.wav", 'wb') as wf:
+        # WRITE FILE
+        with wave.open(ABS_FILE_PATH, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
             wf.setframerate(mic_rate)
-            wf.writeframes(b''.join(st.session_state.frames))
-
+            wf.writeframes(b''.join(frames))
+        
+        st.session_state.file_ready = True
+        
         mic_stream.stop_stream(); mic_stream.close()
         if loop_stream: loop_stream.stop_stream(); loop_stream.close()
     finally:
         p.terminate()
 
-# --- AI WRAPPERS ---
 def run_ai_analysis(model_size):
+    """ AI Pipeline: Whisper -> Phi-3 Diarization """
     # Transcription
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments, _ = model.transcribe("temp_session.wav", beam_size=5)
-    text = " ".join([s.text for s in segments])
+    segments, _ = model.transcribe(ABS_FILE_PATH, beam_size=5)
+    raw_text = " ".join([s.text for s in segments])
     
-    # Diarization
-    res = ollama.chat(model='phi3', messages=[{
-        'role': 'user', 
-        'content': f"Format this as a dialogue between 'Speaker 1' (Mic) and 'Speaker 2' (Remote Call): {text}"
-    }])
+    # Diarization Logic
+    prompt = f"Convert this text into a dialogue. 'Speaker 1' is the local mic, 'Speaker 2' is the remote caller: {raw_text}"
+    res = ollama.chat(model='phi3', messages=[{'role': 'user', 'content': prompt}])
     return res['message']['content']
 
-# --- SIDEBAR ---
+# --- 5. SIDEBAR UI ---
 with st.sidebar:
     st.markdown('<h1 style="text-align: center;">🛡️ EdgeSecure</h1>', unsafe_allow_html=True)
     has_npu, npu_msg = check_amd_npu()
-    st.info(npu_msg)
+    st.success(f"NPU Status: {npu_msg}")
     st.divider()
     model_choice = st.selectbox("Whisper Sensitivity", ["base", "small"])
-    ghost_mode = st.toggle("Ghost Mode (Intercept System Audio)", value=True)
-    if st.button("🗑️ Emergency Wipe"):
+    ghost_mode = st.toggle("Ghost Mode (Intercept Meeting Audio)", value=True)
+    if st.button("🗑️ Wipe Session Cache"):
         st.session_state.clear()
+        if os.path.exists(ABS_FILE_PATH): os.remove(ABS_FILE_PATH)
         st.rerun()
 
-# --- MAIN UI ---
-st.title("🛡️ EdgeSecure Intelligence Dashboard")
-tab1, tab2, tab3 = st.tabs(["🎙️ Meeting Scribe", "📄 Document Vault", "💬 Secure Chat"])
+# --- 6. MAIN UI ---
+st.title("🛡️ Intelligence Control Center")
+t1, t2, t3 = st.tabs(["🎙️ Meeting Scribe", "📄 Vault", "💬 Secure Chat"])
 
-with tab1:
-    col_ctrl, col_view = st.columns([1, 1.5])
-
-    with col_ctrl:
-        st.subheader("Session Control")
+with t1:
+    c1, c2 = st.columns([1, 1.5])
+    with c1:
+        st.subheader("Ghost Mode Capture")
         
         if not st.session_state.recording_active:
-            if st.button("🔴 Start Encrypted Recording", use_container_width=True):
+            if st.button("🔴 Start Live Recording", use_container_width=True):
                 st.session_state.recording_active = True
-                # Start recording in background thread
-                threading.Thread(target=recording_thread_func, args=(ghost_mode,), daemon=True).start()
+                st.session_state.file_ready = False
+                threading.Thread(target=recording_background_worker, args=(ghost_mode,), daemon=True).start()
                 st.rerun()
         else:
-            st.markdown('<p class="recording-status">🔴 RECORDING LIVE...</p>', unsafe_allow_html=True)
-            if st.button("⏹️ Stop and Process Session", use_container_width=True):
+            st.markdown('<p class="recording-status">🔴 RECORDING ACTIVE...</p>', unsafe_allow_html=True)
+            if st.button("⏹️ Stop & Transcribe", use_container_width=True):
                 st.session_state.recording_active = False
-                with st.spinner("NPU-Optimized Transcription in progress..."):
-                    # Give the thread a split second to save the file
-                    time.sleep(1) 
+                # Block until file is ready
+                with st.spinner("Closing Secure Stream & Saving..."):
+                    while not st.session_state.file_ready:
+                        time.sleep(0.1)
+                
+                with st.spinner("AI Diarization (NPU Optimized)..."):
                     st.session_state.transcript = run_ai_analysis(model_choice)
                 st.rerun()
 
         if st.session_state.transcript:
-            if st.button("📝 Summarize Meeting"):
+            if st.button("📋 Generate Summary"):
                 res = ollama.chat(model='phi3', messages=[
-                    {'role': 'system', 'content': 'Summarize this meeting into high-level action items.'},
+                    {'role': 'system', 'content': 'Provide a concise bulleted summary of action items.'},
                     {'role': 'user', 'content': st.session_state.transcript}
                 ])
                 st.session_state.summary = res['message']['content']
 
-    with col_view:
+    with c2:
         if st.session_state.transcript:
-            st.markdown("**Local AI Transcript:**")
+            st.markdown("**Transcript (with Local Diarization):**")
             st.info(st.session_state.transcript)
             if st.session_state.summary:
                 st.markdown("**Executive Summary:**")
                 st.success(st.session_state.summary)
 
-# --- TAB 2 & 3 (Same logic as before) ---
-with tab2:
-    st.subheader("Local PDF Ingestion")
-    uploaded_file = st.file_uploader("Drop sensitive PDF", type=['pdf'])
-    if uploaded_file and st.button("🔍 Secure Ingest"):
-        doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-        st.session_state.doc_text = "".join([page.get_text() for page in doc])
-        st.success("Document analyzed.")
+with t2:
+    st.subheader("Local PDF Vault")
+    up = st.file_uploader("Upload Sensitive Files", type=['pdf'])
+    if up and st.button("🔍 Ingest PDF"):
+        doc = fitz.open(stream=up.read(), filetype="pdf")
+        st.session_state.doc_text = "".join([p.get_text() for p in doc])
+        st.success("Document analyzed and stored in RAM.")
 
-with tab3:
+with t3:
     if st.session_state.transcript or st.session_state.doc_text:
         context = f"Transcript: {st.session_state.transcript}\nDoc: {st.session_state.doc_text[:1500]}"
         for chat in st.session_state.chat_history:
             with st.chat_message("user"): st.write(chat['q'])
             with st.chat_message("assistant"): st.write(chat['a'])
         
-        user_input = st.chat_input("Ask about your data...")
-        if user_input:
-            with st.chat_message("user"): st.write(user_input)
-            response = ollama.chat(model='phi3', messages=[
-                {'role': 'system', 'content': f'Answer only based on: {context}'},
-                {'role': 'user', 'content': user_input}
+        u_in = st.chat_input("Query local data...")
+        if u_in:
+            with st.chat_message("user"): st.write(u_in)
+            ans = ollama.chat(model='phi3', messages=[
+                {'role': 'system', 'content': f'Answer based only on: {context}'},
+                {'role': 'user', 'content': u_in}
             ])
-            st.write(response['message']['content'])
-            st.session_state.chat_history.append({"q": user_input, "a": response['message']['content']})
+            st.session_state.chat_history.append({"q": u_in, "a": ans['message']['content']})
+            st.rerun()
     else:
-        st.warning("No context available.")
+        st.warning("No context available. Capture audio or upload a PDF first.")
