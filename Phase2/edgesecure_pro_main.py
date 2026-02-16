@@ -120,45 +120,70 @@ def record_audio_simple(duration_seconds=30):
 # ============================================================================
 
 def transcribe_audio(audio_file, model_size="base"):
-    """Transcribe with WhisperX"""
-    
-    if not whisperx:
-        return None, None, "❌ WhisperX not installed"
+    """Transcribe audio - uses simple Whisper to avoid Pyannote dependency issues"""
     
     try:
-        st.info(f"Loading WhisperX {model_size} model...")
-        
-        model = whisperx.load_model(
-            model_size,
-            device=DEVICE,
-            compute_type=COMPUTE_TYPE,
-            asr_options={
-                "language": "en",
-                "beam_size": 5,
-                "temperature": 0.0
-            }
-        )
-        
-        st.info("Transcribing audio...")
-        result = model.transcribe(
-            audio_file,
-            batch_size=8 if DEVICE == "cuda" else 4
-        )
-        
-        # Try diarization (optional)
+        # Try to use OpenAI Whisper (simpler, more reliable)
         try:
-            st.info("Identifying speakers...")
-            diarize_model = whisperx.DiarizationPipeline(device=DEVICE)
-            diarize_segments = diarize_model(audio_file)
-            result = whisperx.assign_word_speakers(diarize_segments, result)
-        except:
-            diarize_segments = None
-            st.warning("⚠️ Diarization skipped (optional feature)")
-        
-        return result, diarize_segments, None
+            import whisper
+            st.info(f"Loading Whisper {model_size} model...")
+            
+            model = whisper.load_model(model_size, device=DEVICE)
+            
+            st.info("Transcribing audio...")
+            result = model.transcribe(
+                audio_file,
+                language="en",
+                verbose=False
+            )
+            
+            # Format result for consistency
+            formatted_result = {
+                'segments': [
+                    {
+                        'start': seg['start'],
+                        'end': seg['end'],
+                        'text': seg['text'].strip(),
+                        'speaker': 'SPEAKER_00'
+                    } for seg in result.get('segments', [])
+                    if seg.get('text', '').strip()
+                ],
+                'language': result.get('language', 'en')
+            }
+            
+            return formatted_result, None, None
+            
+        except ImportError:
+            # Fallback: Use faster-whisper
+            from faster_whisper import WhisperModel
+            
+            st.info(f"Loading Whisper {model_size} model...")
+            model = WhisperModel(model_size, device=DEVICE, compute_type=COMPUTE_TYPE)
+            
+            st.info("Transcribing audio...")
+            segments, info = model.transcribe(audio_file, beam_size=5, language="en")
+            
+            segment_list = list(segments)
+            
+            formatted_result = {
+                'segments': [
+                    {
+                        'start': seg.start,
+                        'end': seg.end,
+                        'text': seg.text.strip(),
+                        'speaker': 'SPEAKER_00'
+                    } for seg in segment_list
+                    if seg.text.strip()
+                ],
+                'language': 'en'
+            }
+            
+            return formatted_result, None, None
         
     except Exception as e:
         logger.error(f"Transcription error: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None, f"❌ Transcription error: {str(e)}"
 
 def format_transcript(result):
